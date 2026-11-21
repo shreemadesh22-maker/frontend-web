@@ -5,39 +5,44 @@ pipeline {
     options {
         timestamps()
         disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
     }
 
     environment {
-        AWS_REGION     = 'eu-north-1'
         AWS_ACCOUNT_ID = '887074880802'
-        ECR_REPOSITORY = 'frontend-website'
-
-        IMAGE_TAG      = "${BUILD_NUMBER}"
-        CONTAINER_NAME = 'frontend-container'
+        AWS_REGION     = 'eu-north-1'
+        ECR_REPOSITORY = 'front-end-web'
         ECR_REGISTRY   = '887074880802.dkr.ecr.eu-north-1.amazonaws.com'
-        ECR_URI        = '887074880802.dkr.ecr.eu-north-1.amazonaws.com/frontend-web'
+
+        IMAGE_NAME     = 'frontend-container'
+        CONTAINER_NAME = 'frontend-container'
     }
 
     stages {
 
-        stage('1. Checkout GitHub') {
+        stage('Checkout Code') {
             steps {
-                echo 'Pulling source code from GitHub'
+                echo 'Downloading source code from GitHub...'
                 checkout scm
-                sh 'ls -la'
             }
         }
 
-        stage('2. Verify AWS Identity') {
+        stage('Build Docker Image') {
             steps {
+                echo 'Building frontend Docker image...'
+
                 sh '''
-                    aws sts get-caller-identity
+                    docker build --pull \
+                    -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER} \
+                    -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest .
                 '''
             }
         }
 
-        stage('3. ECR Login') {
+        stage('Login to AWS ECR') {
             steps {
+                echo 'Authenticating with Amazon ECR...'
+
                 sh '''
                     aws ecr get-login-password \
                     --region ${AWS_REGION} | \
@@ -48,67 +53,47 @@ pipeline {
             }
         }
 
-        stage('4. Build Docker Image') {
+        stage('Push Image to ECR') {
             steps {
+                echo 'Pushing Docker image to ECR...'
+
                 sh '''
-                    docker build \
-                    -t ${ECR_URI}:${IMAGE_TAG} .
+                    docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER}
+
+                    docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
                 '''
             }
         }
 
-        stage('5. Tag Docker Image') {
+        stage('Deploy on EC2') {
             steps {
-                sh '''
-                    docker tag \
-                    ${ECR_URI}:${IMAGE_TAG} \
-                    ${ECR_URI}:latest
-                '''
-            }
-        }
+                echo 'Deploying frontend container...'
 
-        stage('6. Push Image to ECR') {
-            steps {
                 sh '''
-                    docker push ${ECR_URI}:${IMAGE_TAG}
-                    docker push ${ECR_URI}:latest
-                '''
-            }
-        }
+                    # Pull the newly built image
+                    docker pull ${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER}
 
-        stage('7. Pull Image from ECR') {
-            steps {
-                sh '''
-                    docker pull ${ECR_URI}:${IMAGE_TAG}
-                '''
-            }
-        }
+                    # Remove previous containers if present
+                    for container in frontend-container frontend-website; do
+                        docker rm -f "$container" 2>/dev/null || true
+                    done
 
-        stage('8. Stop Old Container') {
-            steps {
-                sh '''
-                    docker rm -f ${CONTAINER_NAME} || true
-                '''
-            }
-        }
-
-        stage('9. Deploy Container') {
-            steps {
-                sh '''
+                    # Start the new frontend container
                     docker run -d \
-                    --name ${CONTAINER_NAME} \
-                    --restart unless-stopped \
-                    -p 80:80 \
-                    ${ECR_URI}:${IMAGE_TAG}
-                '''
-            }
-        }
+                        --name ${CONTAINER_NAME} \
+                        --restart unless-stopped \
+                        -p 80:80 \
+                        ${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER}
 
-        stage('10. Verify Deployment') {
-            steps {
-                sh '''
-                    docker ps
-                    curl -f http://localhost/
+                    # Verify deployment
+                    sleep 5
+
+                    curl -f http://localhost/ || {
+                        echo "Frontend deployment health check failed!"
+                        exit 1
+                    }
+
+                    echo "Frontend deployed successfully!"
                 '''
             }
         }
@@ -116,15 +101,16 @@ pipeline {
 
     post {
         success {
-            echo 'SUCCESS: Image pushed to ECR and application deployed!'
+            echo 'CI/CD Pipeline completed successfully!'
+            echo 'Frontend website is running on EC2 port 80.'
         }
 
         failure {
-            echo 'FAILED: Check Jenkins Console Output.'
+            echo 'CI/CD Pipeline failed. Check the stage logs.'
         }
 
         always {
-            echo 'ECR CI/CD Pipeline execution completed.'
+            sh 'docker logout ${ECR_REGISTRY} || true'
         }
     }
 }
